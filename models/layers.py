@@ -4,7 +4,7 @@ from torch.nn import init
 from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import numbers
-from typing import Union, List, Tuple
+from typing import Tuple
 from torch import Tensor, Size
 
 
