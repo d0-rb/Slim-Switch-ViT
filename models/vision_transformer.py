@@ -34,6 +34,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.models.helpers import build_model_with_cfg, named_apply, adapt_input_conv
@@ -41,7 +42,7 @@ from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_n
 from timm.models.registry import register_model
 
 from .base_model import BaseModel
-from .layers import SwitchableLayerNorm
+from .layers import SwitchableLayerNorm, MultipleSequential
 
 _logger = logging.getLogger(__name__)
 
@@ -235,13 +236,13 @@ class SwitchableBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, bucket: int | None = None):
-        x, buckets = self.norm1(x)
+        x, buckets = self.norm1(x, bucket)
         # Adust slim based on buckets
         x = x + self.drop_path(self.attn(x))
-        x, buckets = self.norm2(x)
+        x, buckets = self.norm2(x, bucket)
         # Adust slim based on buckets
         x = x + self.drop_path(self.mlp(x))
-        return x
+        return x, bucket
 
 
 class SwitchableVisionTransformer(nn.Module):
@@ -297,7 +298,7 @@ class SwitchableVisionTransformer(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        self.blocks = nn.Sequential(*[
+        self.blocks = MultipleSequential(*[
             SwitchableBlock(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer)
@@ -367,8 +368,9 @@ class SwitchableVisionTransformer(nn.Module):
         else:
             x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
-        x = self.blocks(x, bucket)
-        x, buckets = self.norm(x, bucket: int | None = None)
+        x, buckets = self.blocks(x, bucket)
+        x, buckets = self.norm(x, bucket)
+        print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
         if self.dist_token is None:
             return self.pre_logits(x[:, 0])
         else:
@@ -511,6 +513,7 @@ class VisionTransformer(nn.Module):
         x = self.pos_drop(x + self.pos_embed)
         x = self.blocks(x)
         x = self.norm(x)
+        print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
         if self.dist_token is None:
             return self.pre_logits(x[:, 0])
         else:

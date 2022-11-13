@@ -4,11 +4,23 @@ from torch.nn import init
 from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import numbers
-from typing import Tuple
+from typing import List, Tuple
 from torch import Tensor, Size
 
 
 _shape_t = int | List[int] | Size
+
+
+# Version of nn.Sequential which can accept multiple inputs/outputs between modules
+# https://github.com/pytorch/pytorch/issues/19808#issuecomment-487291323
+class MultipleSequential(nn.Sequential):
+    def forward(self, *inputs):
+        for module in self:
+            if type(inputs) == tuple:
+                inputs = module(*inputs)
+            else:
+                inputs = module(inputs)
+        return inputs
 
 
 class SwitchableLayerNorm(nn.Module):
@@ -25,6 +37,7 @@ class SwitchableLayerNorm(nn.Module):
             # mypy error: incompatible types in assignment
             normalized_shape = (normalized_shape,)  # type: ignore[assignment]
         self.normalized_shape = tuple(normalized_shape)  # type: ignore[arg-type]
+        self.dims = tuple(i - len(normalized_shape) for i in range(len(normalized_shape)))
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         self.switchable_buckets = switchable_buckets
@@ -35,8 +48,8 @@ class SwitchableLayerNorm(nn.Module):
             self.register_parameter('weight', None)
             self.register_parameter('bias', None)
         
-        self.buckets = torch.empty(1, self.switchable_buckets, 2)  # Last dim is for mean, var
-        self.bucket_amounts = torch.empty(self.switchable_buckets)  # Number of samples that have been sent to each bucket
+        self.buckets = Parameter(torch.empty(1, self.switchable_buckets, 2, **factory_kwargs, requires_grad=False), requires_grad=False)  # Last dim is for mean, var
+        self.bucket_amounts = Parameter(torch.empty(self.switchable_buckets, device=device, dtype=torch.long, requires_grad=False), requires_grad=False)  # Number of samples that have been sent to each bucket
 
         self.reset_parameters()
 
@@ -47,36 +60,108 @@ class SwitchableLayerNorm(nn.Module):
 
     # Passing in bucket means we are in training curriculum stage, not passing bucket means we want it to be switched
     # Input is (*, normalized_shape[0], normalized_shape[1], ...)
-    def forward(self, input: Tensor, bucket: int | None = None) -> Tensor:
-        assert 0 <= bucket < self.bucket_amounts, "Passed bucket index for updating bucket statistics is invalid!"
+    def forward(self, input: Tensor, bucket: Tensor | int | None = None) -> Tensor:
+        unnormalized_dims = input.shape[:self.dims[0]]
+        
+        if isinstance(bucket, int):
+            assert 0 <= bucket < self.switchable_buckets, "Passed bucket index for updating bucket statistics is invalid!"
+            bucket = torch.tensor(bucket)
+        if isinstance(bucket, Tensor):  # Should be shape (*)
+            assert 0 <= bucket.min() and bucket.max() < self.switchable_buckets, "Passed bucket tensor for updating bucket statistics has invalid indices!"
+            assert not torch.is_floating_point(bucket), "Passed bucket tensor should be dtype int (or long or other equivalent)!"
+            bucket = bucket.broadcast_to(unnormalized_dims)
 
-        mean = torch.mean(input, dim=self.normalized_shape)  # (*)
-        input_mean_diff = torch.sub(input, mean)
-        var = torch.square(input_mean_diff).mean(dim=self.normalized_shape, keepdim=True)  # (*, 1, 1, ...)
+        mean = torch.mean(input, dim=self.dims, keepdim=True)  # (*, 1, 1, ...)
+        input_mean_diff = input - mean
+        var = torch.square(input_mean_diff).mean(dim=self.dims, keepdim=True)  # (*, 1, 1, ...)
 
-        normalized = torch.div(input_mean_diff, torch.sqrt(torch.add(var, self.eps)))  # Same shape as input
+        normalized = input_mean_diff / torch.sqrt(var + self.eps)  # Same shape as input
 
-        transformed_normalized = torch.add(torch.mul(normalized, self.weight), self.bias) if self.elementwise_affine else normalized  # Same shape as input
+        transformed_normalized = normalized * self.weight + self.bias if self.elementwise_affine else normalized  # Same shape as input
 
         if bucket is None:  # If we want a bucket to be selected
-            mean_var_combined = torch.stack([mean, var.squeeze()], dim=-1)  # (*, 2)
+            mean_var_combined = torch.stack([mean.squeeze(), var.squeeze()], dim=-1)  # (*, 2)
 
             bucket_distances = torch.cdist(mean_var_combined, self.buckets, p=2)  # (*, self.switchable_buckets)
-            selected_buckets = torch.min(bucket_distances, dim=-1)  # {*) Gets lowest distances from each bucket
+            selected_buckets = torch.min(bucket_distances, dim=-1)  # (*) Gets lowest distances from each bucket
 
             return transformed_normalized, selected_buckets
-        else:  # If we want to update a bucket's statistics by sending this to the bucket
-            added_amt = mean.numel()
-            self.bucket_amounts[bucket] += added_amt
-            # Relative added amount; e.g., an input with 20 samples sent to a bucket with 80 contributed 20% to the new total
-            added_amt_rel = torch.div(added_amt, self.bucket_amounts[bucket])
+        else:  # If we want to update a bucket's statistics by sending this batch to the passed bucket(s)
+            added_amts = bucket.flatten().bincount()
+            self.bucket_amounts += added_amts
+
+            nonzero = self.bucket_amounts != 0
+            # Relative added amounts; e.g., an input with 20 samples sent to a bucket with 80 contributed 20% to the new total
+            added_amts_rel = torch.zeros_like(added_amts)
+            added_amts_rel[nonzero] = added_amts[nonzero] / self.bucket_amounts[nonzero]
+
+            # Will hold mean of means for each bucket
+            means = mean.unsqueeze(0).expand(*added_amts.shape, *mean.shape).view(*added_amts.shape, -1)  # (# of given buckets, 1)
+            indices = torch.arange(end=added_amts.size(dim=0)).reshape(-1, 1)
+            means = means * (bucket == indices)  # Same shape, but now each element along dim 0 holds means for a particular bucket
+            means = means.mean(1)  # Take mean of means for each bucket
+
+            # Will hold mean of vars for each bucket
+            vars = var.unsqueeze(0).expand(*added_amts.shape, *var.shape).view(*added_amts.shape, -1)  # (# of given buckets, 1)
+            vars = vars * (bucket == indices)  # Same shape, but now each element along dim 0 holds vars for a particular bucket
+            vars = vars.mean(1)  # Take mean of vars for each bucket
 
             # Updating means
-            self.buckets[0, bucket, 0] = torch.mean(mean) * added_amt_rel + self.buckets[0, bucket, 0] * (1 - added_amt_rel)
+            self.buckets[0, :, 0][nonzero] = (means * added_amts_rel + self.buckets[0, :, 0] * (1 - added_amts_rel))[nonzero]
             # Updating vars
-            self.buckets[0, bucket, 1] = torch.mean(mean) * added_amt_rel + self.buckets[0, bucket, 1] * (1 - added_amt_rel)
+            self.buckets[0, :, 1][nonzero] = (vars * added_amts_rel + self.buckets[0, :, 1] * (1 - added_amts_rel))[nonzero]
 
-            return transformed_normalized, torch.tile(torch.tensor(bucket), mean.shape)
+            return transformed_normalized, bucket
+
+
+    def extra_repr(self) -> str:
+        return '{normalized_shape}, eps={eps}, ' \
+            'elementwise_affine={elementwise_affine}'.format(**self.__dict__)
+
+
+class LayerNorm(nn.Module):
+    __constants__ = ['normalized_shape', 'eps', 'elementwise_affine']
+    normalized_shape: Tuple[int, ...]
+    eps: float
+    elementwise_affine: bool
+
+    def __init__(self, normalized_shape: _shape_t, eps: float = 1e-5, elementwise_affine: bool = True,
+                 device=None, dtype=None) -> None:
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super(LayerNorm, self).__init__()
+        if isinstance(normalized_shape, numbers.Integral):
+            # mypy error: incompatible types in assignment
+            normalized_shape = (normalized_shape,)  # type: ignore[assignment]
+        self.normalized_shape = tuple(normalized_shape)  # type: ignore[arg-type]
+        self.dims = tuple(i - len(normalized_shape) for i in range(len(normalized_shape)))
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
+            self.bias = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.elementwise_affine:
+            init.ones_(self.weight)
+            init.zeros_(self.bias)
+
+    # Passing in bucket means we are in training curriculum stage, not passing bucket means we want it to be switched
+    # Input is (*, normalized_shape[0], normalized_shape[1], ...)
+    def forward(self, input: Tensor) -> Tensor:
+        mean = torch.mean(input, dim=self.dims, keepdim=True)  # (*, 1, 1, ...)
+        input_mean_diff = input - mean
+        var = torch.square(input_mean_diff).mean(dim=self.dims, keepdim=True)  # (*, 1, 1, ...)
+
+        normalized = input_mean_diff / torch.sqrt(var + self.eps)  # Same shape as input
+
+        transformed_normalized = normalized * self.weight + self.bias if self.elementwise_affine else normalized  # Same shape as input
+        
+        return transformed_normalized
 
     def extra_repr(self) -> str:
         return '{normalized_shape}, eps={eps}, ' \
