@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.nn import init
+from torch.nn import init, ParameterList
 from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import numbers
@@ -42,25 +42,32 @@ class SwitchableLayerNorm(nn.Module):
         self.elementwise_affine = elementwise_affine
         self.switchable_buckets = switchable_buckets
         if self.elementwise_affine:
-            self.weight = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
-            self.bias = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
+            self.weights = Parameter(torch.empty((self.switchable_buckets, *self.normalized_shape), **factory_kwargs))  # First dim is bucket dim
+            self.biases = Parameter(torch.empty((self.switchable_buckets, *self.normalized_shape), **factory_kwargs))
+            # self.weight = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
+            # self.bias = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
         else:
             self.register_parameter('weight', None)
             self.register_parameter('bias', None)
         
-        self.buckets = Parameter(torch.empty(1, self.switchable_buckets, 2, **factory_kwargs, requires_grad=False), requires_grad=False)  # Last dim is for mean, var
-        self.bucket_amounts = Parameter(torch.empty(self.switchable_buckets, device=device, dtype=torch.long, requires_grad=False), requires_grad=False)  # Number of samples that have been sent to each bucket
+        self.buckets = Parameter(torch.empty(self.switchable_buckets, 2, **factory_kwargs), requires_grad=False)  # Last dim is for mean, var
+        self.bucket_amounts = Parameter(torch.empty(self.switchable_buckets, device=device, dtype=torch.long), requires_grad=False)  # Number of samples that have been sent to each bucket
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         if self.elementwise_affine:
-            init.ones_(self.weight)
-            init.zeros_(self.bias)
+            # init.ones_(self.weight)
+            # init.zeros_(self.bias)
+            init.ones_(self.weights)
+            init.zeros_(self.biases)
 
     # Passing in bucket means we are in training curriculum stage, not passing bucket means we want it to be switched
     # Input is (*, normalized_shape[0], normalized_shape[1], ...)
     def forward(self, input: Tensor, bucket: Tensor | int | None = None) -> Tensor:
+        # return F.layer_norm(
+        #     input, self.normalized_shape, self.weights[0], self.biases[0], self.eps), bucket
+
         unnormalized_dims = input.shape[:self.dims[0]]
         
         if isinstance(bucket, int):
@@ -69,7 +76,7 @@ class SwitchableLayerNorm(nn.Module):
         if isinstance(bucket, Tensor):  # Should be shape (*)
             assert 0 <= bucket.min() and bucket.max() < self.switchable_buckets, "Passed bucket tensor for updating bucket statistics has invalid indices!"
             assert not torch.is_floating_point(bucket), "Passed bucket tensor should be dtype int (or long or other equivalent)!"
-            bucket = bucket.broadcast_to(unnormalized_dims)
+            bucket = bucket.broadcast_to(unnormalized_dims)  # (*)
 
         mean = torch.mean(input, dim=self.dims, keepdim=True)  # (*, 1, 1, ...)
         input_mean_diff = input - mean
@@ -77,15 +84,34 @@ class SwitchableLayerNorm(nn.Module):
 
         normalized = input_mean_diff / torch.sqrt(var + self.eps)  # Same shape as input
 
-        transformed_normalized = normalized * self.weight + self.bias if self.elementwise_affine else normalized  # Same shape as input
-
         if bucket is None:  # If we want a bucket to be selected
             mean_var_combined = torch.stack([mean.squeeze(), var.squeeze()], dim=-1)  # (*, 2)
 
             bucket_distances = torch.cdist(mean_var_combined, self.buckets, p=2)  # (*, self.switchable_buckets)
-            selected_buckets = torch.min(bucket_distances, dim=-1)  # (*) Gets lowest distances from each bucket
+            selected_buckets = bucket_distances.argmin(dim=-1)  # (*) Gets indices of lowest distances from each bucket
+
+            # selected_buckets = torch.cdist(torch.stack([mean.squeeze(), var.squeeze()], dim=-1), self.buckets, p=2).argmin(dim=-1)  # (*) Gets indices of lowest distances from each bucket
+
+            # Will separate normalized by bucket
+            # normalized_separate = normalized.unsqueeze(0).expand(self.switchable_buckets, *normalized.shape)  # (# of buckets, *, *normalized_shape)
+            # indices = torch.arange(end=self.switchable_buckets).view(-1, *((1,) * len(normalized.shape)))  # (# of buckets, 1, 1, ...)
+            # transformed_normalized_separate = normalized_separate * self.weights.view(self.switchable_buckets, *((1,) * len(unnormalized_dims)), *self.normalized_shape) + self.biases.view(self.switchable_buckets, *((1,) * len(unnormalized_dims)), *self.normalized_shape)
+            # transformed_normalized_separate = transformed_normalized_separate * (bucket == indices)  # Same shape, but now each element along dim 0 holds normalized values for a particular bucket            
+            # transformed_normalized = transformed_normalized_separate.sum(dim=0)
+            
+            # transformed_normalized = normalized * self.weights[selected_buckets] + self.biases[selected_buckets]
+            
+            # transformed_normalized = normalized * self.weight + self.bias
+
+            transformed_normalized = normalized
+            
+            if self.elementwise_affine:
+                for i in range(self.switchable_buckets):
+                    transformed_normalized[bucket == i] = transformed_normalized[bucket == i] * self.weights[i] + self.biases[i]
+                    # normalized[bucket == i] = normalized[bucket == i] * self.weights[i] + self.biases[i]
 
             return transformed_normalized, selected_buckets
+            # return normalized, selected_buckets
         else:  # If we want to update a bucket's statistics by sending this batch to the passed bucket(s)
             added_amts = bucket.flatten().bincount()
             self.bucket_amounts += added_amts
@@ -97,7 +123,7 @@ class SwitchableLayerNorm(nn.Module):
 
             # Will hold mean of means for each bucket
             means = mean.unsqueeze(0).expand(*added_amts.shape, *mean.shape).view(*added_amts.shape, -1)  # (# of given buckets, 1)
-            indices = torch.arange(end=added_amts.size(dim=0)).reshape(-1, 1)
+            indices = torch.arange(end=added_amts.size(dim=0)).view(-1, 1)
             means = means * (bucket == indices)  # Same shape, but now each element along dim 0 holds means for a particular bucket
             means = means.mean(1)  # Take mean of means for each bucket
 
@@ -107,9 +133,11 @@ class SwitchableLayerNorm(nn.Module):
             vars = vars.mean(1)  # Take mean of vars for each bucket
 
             # Updating means
-            self.buckets[0, :, 0][nonzero] = (means * added_amts_rel + self.buckets[0, :, 0] * (1 - added_amts_rel))[nonzero]
+            self.buckets[..., 0][nonzero] = (means * added_amts_rel + self.buckets[..., 0] * (1 - added_amts_rel))[nonzero]
             # Updating vars
-            self.buckets[0, :, 1][nonzero] = (vars * added_amts_rel + self.buckets[0, :, 1] * (1 - added_amts_rel))[nonzero]
+            self.buckets[..., 1][nonzero] = (vars * added_amts_rel + self.buckets[..., 1] * (1 - added_amts_rel))[nonzero]
+
+            transformed_normalized = normalized * self.weights[bucket] + self.biases[bucket]
 
             return transformed_normalized, bucket
 
@@ -133,7 +161,7 @@ class LayerNorm(nn.Module):
             # mypy error: incompatible types in assignment
             normalized_shape = (normalized_shape,)  # type: ignore[assignment]
         self.normalized_shape = tuple(normalized_shape)  # type: ignore[arg-type]
-        self.dims = tuple(i - len(normalized_shape) for i in range(len(normalized_shape)))
+        self.dims = normalized_shape if isinstance(normalized_shape, int) else tuple(i - len(normalized_shape) for i in range(len(normalized_shape)))
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         if self.elementwise_affine:
@@ -150,8 +178,6 @@ class LayerNorm(nn.Module):
             init.ones_(self.weight)
             init.zeros_(self.bias)
 
-    # Passing in bucket means we are in training curriculum stage, not passing bucket means we want it to be switched
-    # Input is (*, normalized_shape[0], normalized_shape[1], ...)
     def forward(self, input: Tensor) -> Tensor:
         mean = torch.mean(input, dim=self.dims, keepdim=True)  # (*, 1, 1, ...)
         input_mean_diff = input - mean

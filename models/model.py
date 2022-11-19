@@ -7,11 +7,11 @@ import torch
 import torch.nn as nn
 from functools import partial
 
-from timm.models.vision_transformer import VisionTransformer, _cfg
+from timm.models.vision_transformer import _cfg
 from timm.models.registry import register_model
 from timm.models.layers import trunc_normal_
 
-from .vision_transformer import SwitchableVisionTransformer
+from .vision_transformer import VisionTransformer, SwitchableVisionTransformer
 from .layers import SwitchableLayerNorm, LayerNorm
 
 
@@ -86,11 +86,8 @@ def deit_tiny_patch16_224(pretrained=False, **kwargs):
 def deit_sw_tiny_patch16_224(pretrained=False, **kwargs):
     model = SwitchableVisionTransformer(
         patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(LayerNorm, eps=1e-6), **kwargs)
-    # model = VisionTransformer(
-    #     patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
-    #     norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    # model.default_cfg = _cfg()
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    model.default_cfg = _cfg()
     # if pretrained:
     #     checkpoint = torch.hub.load_state_dict_from_url(
     #         url="https://dl.fbaipublicfiles.com/deit/deit_tiny_patch16_224-a1311bcf.pth",

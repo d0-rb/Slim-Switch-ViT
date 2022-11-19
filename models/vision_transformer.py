@@ -34,7 +34,6 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.profiler import profile, record_function, ProfilerActivity
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.models.helpers import build_model_with_cfg, named_apply, adapt_input_conv
@@ -206,13 +205,15 @@ class Attention(nn.Module):
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, num_tokens=-1):
         super().__init__()
-        self.norm1 = norm_layer(dim)
+        self.norm1 = norm_layer(dim)  # layernorm (token norm)
+        # self.norm1 = norm_layer(num_tokens)  # batchnorm1d (seq norm)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
+        self.norm2 = norm_layer(dim)  # layernorm (token norm)
+        # self.norm2 = norm_layer(num_tokens)  # batchnorm1d (seq norm)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
@@ -225,7 +226,7 @@ class Block(nn.Module):
 class SwitchableBlock(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=SwitchableLayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, num_tokens=-1):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
@@ -236,12 +237,8 @@ class SwitchableBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, bucket: int | None = None):
-        x, buckets = self.norm1(x, bucket)
-        # Adust slim based on buckets
-        x = x + self.drop_path(self.attn(x))
-        x, buckets = self.norm2(x, bucket)
-        # Adust slim based on buckets
-        x = x + self.drop_path(self.mlp(x))
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x, bucket
 
 
@@ -260,7 +257,7 @@ class SwitchableVisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init=''):
+                 act_layer=None, weight_init='', buckets=1):
         """
         Args:
             img_size (int, tuple): input image size
@@ -280,12 +277,13 @@ class SwitchableVisionTransformer(nn.Module):
             embed_layer (nn.Module): patch embedding layer
             norm_layer: (nn.Module): normalization layer
             weight_init: (str): weight init scheme
+            buckets: (int): number of possible buckets
         """
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.num_tokens = 2 if distilled else 1
-        norm_layer = norm_layer or partial(SwitchableLayerNorm, eps=1e-6)
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
 
         self.patch_embed = embed_layer(
@@ -297,12 +295,21 @@ class SwitchableVisionTransformer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
+        self.router = SwitchableLayerNorm(embed_dim, switchable_buckets=buckets)
+        self.train_router(False)
+        self.router_start = 0
+        self.router_end = -1
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        self.blocks = MultipleSequential(*[
+        self.blocks = [
             SwitchableBlock(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
-                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer)
-            for i in range(depth)])
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer, num_tokens=num_patches + self.num_tokens)
+            for i in range(depth)
+        ]
+        self.blocks.insert(self.router_start, self.router)
+        # Insert token-reintroduction block at self.router_end
+        self.blocks = nn.Sequential(*self.blocks)
         self.norm = norm_layer(embed_dim)
 
         # Representation layer
@@ -322,6 +329,11 @@ class SwitchableVisionTransformer(nn.Module):
             self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
 
         self.init_weights(weight_init)
+    
+    def train_router(self, mode: bool = True):
+        self.training_router = mode
+        self.router.train(mode)
+    
 
     def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'nlhb', '')
@@ -368,9 +380,8 @@ class SwitchableVisionTransformer(nn.Module):
         else:
             x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
-        x, buckets = self.blocks(x, bucket)
-        x, buckets = self.norm(x, bucket)
-        print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
+        x = self.blocks(x,)
+        x = self.norm(x)
         if self.dist_token is None:
             return self.pre_logits(x[:, 0])
         else:
@@ -444,9 +455,10 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.Sequential(*[
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
-                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer)
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer, num_tokens=num_patches + self.num_tokens)
             for i in range(depth)])
-        self.norm = norm_layer(embed_dim)
+        self.norm = norm_layer(embed_dim)  # layernorm (token norm)
+        # self.norm = norm_layer(num_patches + self.num_tokens)  # batchnorm1d (seq norm)
 
         # Representation layer
         if representation_size and not distilled:
@@ -513,7 +525,6 @@ class VisionTransformer(nn.Module):
         x = self.pos_drop(x + self.pos_embed)
         x = self.blocks(x)
         x = self.norm(x)
-        print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=10))
         if self.dist_token is None:
             return self.pre_logits(x[:, 0])
         else:
