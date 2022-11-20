@@ -47,11 +47,10 @@ class SwitchableLayerNorm(nn.Module):
             # self.weight = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
             # self.bias = Parameter(torch.empty(self.normalized_shape, **factory_kwargs))
         else:
-            self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
+            self.register_parameter('weights', None)
+            self.register_parameter('biases', None)
         
-        self.buckets = Parameter(torch.empty(self.switchable_buckets, 2, **factory_kwargs), requires_grad=False)  # Last dim is for mean, var
-        self.bucket_amounts = Parameter(torch.empty(self.switchable_buckets, device=device, dtype=torch.long), requires_grad=False)  # Number of samples that have been sent to each bucket
+        self.centroids = torch.empty((self.switchable_buckets, torch.prod(torch.tensor(self.normalized_shape))), **factory_kwargs)  # Centroids for buckets
 
         self.reset_parameters()
 
@@ -61,85 +60,46 @@ class SwitchableLayerNorm(nn.Module):
             # init.zeros_(self.bias)
             init.ones_(self.weights)
             init.zeros_(self.biases)
+    
+    def set_centroids(self, centroids: Tensor) -> None:
+        assert centroids.shape == self.centroids.shape, "Passed centroids must be of shape (switchable_buckets,)!"
+
+        self.centroids = centroids
 
     # Passing in bucket means we are in training curriculum stage, not passing bucket means we want it to be switched
     # Input is (*, normalized_shape[0], normalized_shape[1], ...)
-    def forward(self, input: Tensor, bucket: Tensor | int | None = None) -> Tensor:
+    def forward(self, input: Tensor, buckets: Tensor | int | None = None) -> Tensor:
         # return F.layer_norm(
         #     input, self.normalized_shape, self.weights[0], self.biases[0], self.eps), bucket
 
         unnormalized_dims = input.shape[:self.dims[0]]
         
-        if isinstance(bucket, int):
-            assert 0 <= bucket < self.switchable_buckets, "Passed bucket index for updating bucket statistics is invalid!"
-            bucket = torch.tensor(bucket)
-        if isinstance(bucket, Tensor):  # Should be shape (*)
-            assert 0 <= bucket.min() and bucket.max() < self.switchable_buckets, "Passed bucket tensor for updating bucket statistics has invalid indices!"
-            assert not torch.is_floating_point(bucket), "Passed bucket tensor should be dtype int (or long or other equivalent)!"
-            bucket = bucket.broadcast_to(unnormalized_dims)  # (*)
+        if isinstance(buckets, int):
+            assert 0 <= buckets < self.switchable_buckets, "Passed bucket index for updating bucket statistics is invalid!"
+            buckets = torch.tensor(buckets)
+        if isinstance(buckets, Tensor):  # Should be shape (*)
+            assert 0 <= buckets.min() and buckets.max() < self.switchable_buckets, "Passed buckets tensor has invalid indices!"
+            assert not torch.is_floating_point(buckets), "Passed bucket tensor should be dtype int (or long or other equivalent)!"
+            buckets = buckets.broadcast_to(unnormalized_dims)  # (*)
 
         mean = torch.mean(input, dim=self.dims, keepdim=True)  # (*, 1, 1, ...)
         input_mean_diff = input - mean
         var = torch.square(input_mean_diff).mean(dim=self.dims, keepdim=True)  # (*, 1, 1, ...)
 
         normalized = input_mean_diff / torch.sqrt(var + self.eps)  # Same shape as input
+        selected_buckets = buckets
 
-        if bucket is None:  # If we want a bucket to be selected
-            mean_var_combined = torch.stack([mean.squeeze(), var.squeeze()], dim=-1)  # (*, 2)
-
-            bucket_distances = torch.cdist(mean_var_combined, self.buckets, p=2)  # (*, self.switchable_buckets)
+        if selected_buckets is None:  # If we want buckets to be selected
+            bucket_distances = torch.cdist(input.flatten(start_dim=self.dims[0]), self.centroids, p=2)  # (*, self.switchable_buckets)
             selected_buckets = bucket_distances.argmin(dim=-1)  # (*) Gets indices of lowest distances from each bucket
 
-            # selected_buckets = torch.cdist(torch.stack([mean.squeeze(), var.squeeze()], dim=-1), self.buckets, p=2).argmin(dim=-1)  # (*) Gets indices of lowest distances from each bucket
+        transformed_normalized = normalized
+        
+        if self.elementwise_affine:
+            for i in range(self.switchable_buckets):
+                transformed_normalized[selected_buckets == i] = transformed_normalized[selected_buckets == i] * self.weights[i] + self.biases[i]
 
-            # Will separate normalized by bucket
-            # normalized_separate = normalized.unsqueeze(0).expand(self.switchable_buckets, *normalized.shape)  # (# of buckets, *, *normalized_shape)
-            # indices = torch.arange(end=self.switchable_buckets).view(-1, *((1,) * len(normalized.shape)))  # (# of buckets, 1, 1, ...)
-            # transformed_normalized_separate = normalized_separate * self.weights.view(self.switchable_buckets, *((1,) * len(unnormalized_dims)), *self.normalized_shape) + self.biases.view(self.switchable_buckets, *((1,) * len(unnormalized_dims)), *self.normalized_shape)
-            # transformed_normalized_separate = transformed_normalized_separate * (bucket == indices)  # Same shape, but now each element along dim 0 holds normalized values for a particular bucket            
-            # transformed_normalized = transformed_normalized_separate.sum(dim=0)
-            
-            # transformed_normalized = normalized * self.weights[selected_buckets] + self.biases[selected_buckets]
-            
-            # transformed_normalized = normalized * self.weight + self.bias
-
-            transformed_normalized = normalized
-            
-            if self.elementwise_affine:
-                for i in range(self.switchable_buckets):
-                    transformed_normalized[bucket == i] = transformed_normalized[bucket == i] * self.weights[i] + self.biases[i]
-                    # normalized[bucket == i] = normalized[bucket == i] * self.weights[i] + self.biases[i]
-
-            return transformed_normalized, selected_buckets
-            # return normalized, selected_buckets
-        else:  # If we want to update a bucket's statistics by sending this batch to the passed bucket(s)
-            added_amts = bucket.flatten().bincount()
-            self.bucket_amounts += added_amts
-
-            nonzero = self.bucket_amounts != 0
-            # Relative added amounts; e.g., an input with 20 samples sent to a bucket with 80 contributed 20% to the new total
-            added_amts_rel = torch.zeros_like(added_amts)
-            added_amts_rel[nonzero] = added_amts[nonzero] / self.bucket_amounts[nonzero]
-
-            # Will hold mean of means for each bucket
-            means = mean.unsqueeze(0).expand(*added_amts.shape, *mean.shape).view(*added_amts.shape, -1)  # (# of given buckets, 1)
-            indices = torch.arange(end=added_amts.size(dim=0)).view(-1, 1)
-            means = means * (bucket == indices)  # Same shape, but now each element along dim 0 holds means for a particular bucket
-            means = means.mean(1)  # Take mean of means for each bucket
-
-            # Will hold mean of vars for each bucket
-            vars = var.unsqueeze(0).expand(*added_amts.shape, *var.shape).view(*added_amts.shape, -1)  # (# of given buckets, 1)
-            vars = vars * (bucket == indices)  # Same shape, but now each element along dim 0 holds vars for a particular bucket
-            vars = vars.mean(1)  # Take mean of vars for each bucket
-
-            # Updating means
-            self.buckets[..., 0][nonzero] = (means * added_amts_rel + self.buckets[..., 0] * (1 - added_amts_rel))[nonzero]
-            # Updating vars
-            self.buckets[..., 1][nonzero] = (vars * added_amts_rel + self.buckets[..., 1] * (1 - added_amts_rel))[nonzero]
-
-            transformed_normalized = normalized * self.weights[bucket] + self.biases[bucket]
-
-            return transformed_normalized, bucket
+        return transformed_normalized, selected_buckets
 
 
     def extra_repr(self) -> str:

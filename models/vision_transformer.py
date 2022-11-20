@@ -34,6 +34,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.models.helpers import build_model_with_cfg, named_apply, adapt_input_conv
@@ -296,9 +297,9 @@ class SwitchableVisionTransformer(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         self.router = SwitchableLayerNorm(embed_dim, switchable_buckets=buckets)
-        self.train_router(False)
         self.router_start = 0
         self.router_end = -1
+        self.routing = False
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = [
@@ -307,9 +308,9 @@ class SwitchableVisionTransformer(nn.Module):
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer, num_tokens=num_patches + self.num_tokens)
             for i in range(depth)
         ]
-        self.blocks.insert(self.router_start, self.router)
-        # Insert token-reintroduction block at self.router_end
-        self.blocks = nn.Sequential(*self.blocks)
+        self.pre_blocks = nn.Sequential(*self.blocks[:self.router_start])
+        self.mid_blocks = nn.Sequential(*self.blocks[self.router_start:self.router_end])
+        self.post_blocks = nn.Sequential(*self.blocks[self.router_end:])
         self.norm = norm_layer(embed_dim)
 
         # Representation layer
@@ -330,10 +331,18 @@ class SwitchableVisionTransformer(nn.Module):
 
         self.init_weights(weight_init)
     
-    def train_router(self, mode: bool = True):
-        self.training_router = mode
-        self.router.train(mode)
-    
+    def train(self, mode: bool = True):
+        if not isinstance(mode, bool):
+            raise ValueError("training mode is expected to be boolean")
+        
+        self.training = mode
+        for name, module in self.named_children():
+            if not name is 'router':
+                module.train(mode)
+        return self
+
+    def route(self, mode: bool = True):
+        self.routing = mode
 
     def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'nlhb', '')
@@ -372,7 +381,7 @@ class SwitchableVisionTransformer(nn.Module):
         if self.num_tokens == 2:
             self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x, bucket: int | None = None):
+    def forward_features(self, x, bucket: Tensor | int | None = None, threshold: int = 0):
         x = self.patch_embed(x)
         cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
         if self.dist_token is None:
@@ -380,14 +389,37 @@ class SwitchableVisionTransformer(nn.Module):
         else:
             x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
-        x = self.blocks(x,)
+        pre_x = self.pre_blocks(x)
+        if self.routing:
+            x, bucket = self.router(x, bucket)  # bucket is (*) or unnormalized dims
+
+            # rearrange tensor so that passthru tokens are first and then truncated
+            passthru_mask = bucket >= threshold
+            first_n_seq = passthru_mask.sum(dim=-1)
+            max_passthru_len = first_n_seq.amax(dim=-1)
+            index_x = torch.arange(self.router.switchable_buckets).unsqueeze(0).broadcast_to(passthru_mask.shape)
+            first_n_mask = index_x < passthru_mask
+            rearranged_x = torch.zeros_like(x)
+            rearranged_x[first_n_mask] = x[passthru_mask]
+            shortened_x = rearranged_x[:, max_passthru_len]
+
+            shortened_x = self.mid_blocks(shortened_x)
+
+            # rearrange shortened tensor back to original indices and mask back in skip tokens
+            full_x = torch.empty_like(x)
+            full_x[passthru_mask] = shortened_x[first_n_mask]
+            full_x[passthru_mask == False] = pre_x[passthru_mask == False]
+            x = self.post_blocks(full_x)
+        else:
+            x = self.mid_blocks(pre_x)
+            x = self.post_blocks(x)
         x = self.norm(x)
         if self.dist_token is None:
             return self.pre_logits(x[:, 0])
         else:
             return x[:, 0], x[:, 1]
 
-    def forward(self, x, bucket: int | None = None):
+    def forward(self, x, bucket: int | None = None, threshold: int | None = None):
         x = self.forward_features(x, bucket)
         if self.head_dist is not None:
             x, x_dist = self.head(x[0]), self.head_dist(x[1])  # x must be a tuple
